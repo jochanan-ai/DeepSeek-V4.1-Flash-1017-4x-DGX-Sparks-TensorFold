@@ -6,8 +6,8 @@
 # here (~/.cache/dsv41-tensorfold/logs) and ~/.cache/dsv41-tensorfold/logs on each worker; the newest LOG_KEEP (10) of
 # each rank stay.
 # From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold's stop.sh (Mia's AI Lab).
-# Usage: ./stop.sh      Env: CONTAINER_NAME, PORT, WORKER, WORKER2 (see scripts/config.sh), STOP_TIMEOUT,
-#                       LOG_DIR, LOG_KEEP
+# Usage: ./stop.sh      Env: CONTAINER_NAME, PORT, WORKER, WORKER2, WORKER3 (see scripts/config.sh), STOP_TIMEOUT,
+#                       LOG_DIR, LOG_KEEP, STATE_DIR (its lock: one stop.sh at a time)
 #   DRY_RUN=1 ./stop.sh   says what it would stop, and on which Spark, and stops nothing
 # Exits 1 when a rank could not be stopped or a Spark's containers could not be listed (its rank may still run), so
 # ./start.sh restart and scripts do not go on as if every Spark's GPU memory were free.
@@ -15,6 +15,14 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
 source ./scripts/nodes.sh
+# One stop at a time: a supervisor's own stop (systemd's ExecStop) and FOREGROUND=1 start.sh's clean-up can run
+# together; the second one waits, then finds what the first left. (A Spark has flock; the offline tests may run where
+# it is missing.)
+mkdir -p "$STATE_DIR"
+exec 9>"$STATE_DIR/stop.lock"
+! command -v flock >/dev/null || flock -w 300 9 || die "another ./stop.sh has held $STATE_DIR/stop.lock for 5 minutes"
+STOP_TIMEOUT="${STOP_TIMEOUT:-30}"
+[[ "$STOP_TIMEOUT" =~ ^[0-9]+$ ]] || die "STOP_TIMEOUT is a count of seconds, not $STOP_TIMEOUT"
 
 # Where the containers are: here (rank 0) and on the workers (rank i on worker i). A Spark whose containers could
 # not be listed (ssh or docker ps failed) may still run its rank: unknown=1, and stop.sh fails (exit 1).

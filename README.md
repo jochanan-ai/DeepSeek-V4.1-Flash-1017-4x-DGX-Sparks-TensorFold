@@ -74,6 +74,7 @@ along the way.
 - [NFS](#nfs)
 - [Engram's packed rows (opt-in)](#engrams-packed-rows-opt-in)
 - [How it is split across the four Sparks](#how-it-is-split-across-the-four-sparks)
+- [Under a supervisor (FOREGROUND=1)](#under-a-supervisor-foreground1)
 - [Configuration](#configuration)
 - [What the patches change](#what-the-patches-change)
 - [Repository layout](#repository-layout)
@@ -203,7 +204,7 @@ curl -s localhost:8888/v1/chat/completions -H 'content-type: application/json' -
 ```
 
 `./start.sh restart` (or `./start-switchless.sh restart`) restarts with changed settings; `./stop.sh` stops all
-four ranks.
+four ranks. Under systemd or another supervisor: `FOREGROUND=1` ([below](#under-a-supervisor-foreground1)).
 
 To use Blackfrost-AI’s DERISKED FP8 checkpoint, set `DERISKED=1` in `scripts/local.sh`, or run
 `DERISKED=1 ./start-switchless.sh restart`. Set `DERISKED=0` to return to the original checkpoint.
@@ -400,6 +401,44 @@ pipe, which otherwise stalls the suite.
 See [`CREDITS.md`](CREDITS.md) for the upstream commits. `tools/test_sse_keepalive.py` checks the actual HTTP routes,
 including tool requests, refusal handling, disconnect cancellation and the disabled setting, against a CPU fixture.
 
+## Under a supervisor (FOREGROUND=1)
+
+`./start.sh` returns once the smoke test has passed and leaves the four ranks running. For a supervisor that watches a
+process (a systemd `Type=simple` service, llama-swap), `FOREGROUND=1 ./start.sh` (or `./start-switchless.sh`) starts
+the same way, smoke test included, then stays attached to rank 0's log until the server ends:
+
+- it exits with rank 0's exit code; 1 when one of the workers' ranks ended first, its watchdog failed or rank 0's code
+  cannot be read; 0 when rank 0's container was removed by a `./stop.sh` (a stop that was asked for: a crash leaves
+  the container);
+- any rank ending takes the others down (a lone rank waits for its peers forever): every `FOREGROUND_POLL` seconds (30)
+  a watchdog asks each of `WORKER`, `WORKER2` and `WORKER3` what its container is (one ssh, `docker ps`, bounded by
+  `timeout`). Only an answer counts: "exited" or "no such container" on two polls in a row stops rank 0, and the
+  journal line quotes what docker said; a worker that cannot be asked (ssh or docker out of reach) concludes nothing.
+  Every rank left is then stopped with `./stop.sh`, which saves each rank's log;
+- from the launch on, SIGINT and SIGTERM run `./stop.sh` and exit 130 / 143 (also during the smoke test, which runs in
+  the background and is waited for), and a start that fails (a rank exits,
+  `WAIT_TIMEOUT`, the smoke test) stops every rank before it exits 1;
+- with the server already running on all four Sparks it attaches to it (rank 0's last 50 log lines, no new smoke test)
+  instead of saying "nothing to do";
+- it holds `$STATE_DIR/start.lock` until it exits, so a second `./start.sh` refuses to start meanwhile; `./stop.sh` takes
+  its own lock (`$STATE_DIR/stop.lock`), so a supervisor's stop (`ExecStop=./stop.sh`) and the attached start.sh's
+  clean-up do not race, and start.sh reads rank 0's exit only once that stop has finished.
+
+```ini
+[Service]
+Type=simple
+WorkingDirectory=/absolute/path/to/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold
+Environment=FOREGROUND=1 PREPARE=0
+ExecStart=/usr/bin/bash ./start-switchless.sh
+ExecStop=/usr/bin/bash ./stop.sh
+KillMode=mixed
+TimeoutStopSec=240
+```
+
+Another recipe run from the same account on spark1 (the two-Spark DeepSeek-V4.1 recipe uses the same folders) shares
+`~/.local/state/dsv41-tensorfold` (locks, the prepared marker, NCCL graph files) and `~/.cache/dsv41-tensorfold/logs`
+by default: give this one its own `STATE_DIR` and `LOG_DIR` in `scripts/local.sh`.
+
 ## Configuration
 
 Settings come from the environment, then `scripts/local.sh`, then `./.env`, then the defaults in
@@ -425,6 +464,8 @@ Settings come from the environment, then `scripts/local.sh`, then `./.env`, then
 | `DRAFT_MS` | 25 | the one-stream draft chooser's per-round constant (`TF_DS_DRAFT_MS`) |
 | `SERVED_K` | solo | `solo`, `all` or `off`: where the per-stream draft chooser trims a round (`TF_DS_SAMPLE_CAND`, `TF_DS_PREPASS`, `TF_DS_EXPERT_EXIT`, `TF_DS_PREFILL_YIELD`, `TF_DS_DRAFT_ROW_MS` below are engine switches) |
 | `PORT` | 8888 | |
+| `FOREGROUND` / `FOREGROUND_POLL` | 0 / 30 | stay attached for a supervisor; seconds between its checks of ranks 1-3 ([above](#under-a-supervisor-foreground1)) |
+| `STATE_DIR` / `LOG_DIR` | `~/.local/state/dsv41-tensorfold` / `~/.cache/dsv41-tensorfold/logs` | spark1's locks, prepared marker and NCCL graph files; the saved rank logs |
 
 ## What the patches change
 
