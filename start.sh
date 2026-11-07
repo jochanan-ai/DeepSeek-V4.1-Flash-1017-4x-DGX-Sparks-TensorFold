@@ -10,6 +10,9 @@
 #                               # images); if the server already runs, says so and leaves it alone
 #   ./start.sh restart          # stop every rank (./stop.sh), then start again (e.g. after changing settings)
 #   CONTEXT=262144 ./start.sh restart
+#   FOREGROUND=1 ./start.sh     # for a supervisor (systemd Type=simple, llama-swap): after the smoke test, stay attached
+#                               # to rank 0's log until the server ends, and exit with its code; any rank ending, a
+#                               # failed start, SIGINT or SIGTERM stops every rank (./stop.sh); attaches if already running
 #   DRY_RUN=1 ./start.sh        # print the links found and every rank's docker command, change nothing
 # Extra arguments go to rank 0's `tensorfold-native serve` after the defaults, so they win.
 # Setup: WORKER, WORKER2, WORKER3 (ssh targets, key-based) in scripts/local.sh: on a ring in its order.
@@ -21,7 +24,8 @@
 #            NCCL_DEBUG
 #   files    DERISKED, NVFP4, MODEL_ID, MODEL_REVISION, HF_CACHE, NFS_PATH, NFS_SERVER*, NFS_VOLUME, STATE_DIR, LOG_DIR, LOG_KEEP
 #   engine   TF_REPO, TF_REF, KIT_REPO, KIT_REF, ZIG_VERSION, BASE_IMAGE, IMAGE, CONTAINER_NAME
-#   setup    PREPARE (auto | 1 | 0), WAIT_TIMEOUT (seconds, default 2400), DRY_RUN=1
+#   setup    PREPARE (auto | 1 | 0), WAIT_TIMEOUT (seconds, default 2400), DRY_RUN=1, FOREGROUND=1, FOREGROUND_POLL
+#            (seconds between FOREGROUND=1's checks of ranks 1-3, default 30)
 #   ranks    every TENSORFOLD_* and TF_DS_* variable you set goes to every rank
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
@@ -39,6 +43,11 @@ case "${1:-}" in
   help|-h|--help) usage; exit 0 ;;
 esac
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
+FG="${FOREGROUND:-0}"; FOREGROUND_POLL="${FOREGROUND_POLL:-30}"
+[[ "$FG" =~ ^[01]$ ]] || die "FOREGROUND is 0 or 1, not $FG"
+[[ "$FOREGROUND_POLL" =~ ^[1-9][0-9]*$ ]] || die "FOREGROUND_POLL is a positive count of seconds, not $FOREGROUND_POLL"
+STOP_TIMEOUT="${STOP_TIMEOUT:-30}"
+[[ "$STOP_TIMEOUT" =~ ^[0-9]+$ ]] || die "STOP_TIMEOUT is a count of seconds, not $STOP_TIMEOUT"
 for v in CONTEXT POOL PARALLEL ROUND_ROWS MAX_TOKENS; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v is a positive count, not ${!v}"; done
 (( CONTEXT <= 1048576 )) || die "CONTEXT is at most 1048576 (the model's window), not $CONTEXT"
 (( POOL >= CONTEXT )) || die "POOL ($POOL) holds every stream's positions together: at least CONTEXT ($CONTEXT)"
@@ -72,7 +81,114 @@ URL="http://$API_HOST:$PORT"
 running_here()   { [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
 running_worker() { [[ "$(worker "$1" docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
 all_running() { local i; running_here || return 1; for i in 1 2 3; do running_worker "$i" || return 1; done; }
+
+# FOREGROUND=1: once the smoke test has passed, stay attached to rank 0's log and exit when the server ends, so that a
+# supervisor (systemd's Type=simple, llama-swap) sees the server end: with rank 0's exit code; 1 when one of the
+# workers' ranks ended first, the watchdog failed or rank 0's code cannot be read; 0 when rank 0's container is gone (a
+# ./stop.sh removed it: a stop someone asked for; a crash leaves the container). Any rank ending takes the others down (a
+# lone rank waits for its peers forever): a watchdog asks each worker every FOREGROUND_POLL seconds what its container
+# is (one ssh, docker ps, bounded by timeout). Only an answer counts: "exited" or "gone" seen on two polls in a row stops
+# rank 0; no answer (ssh or docker out of reach) concludes nothing. Every rank left is then stopped with ./stop.sh,
+# which saves each rank's log. From the launch on, SIGINT and SIGTERM run ./stop.sh too, and a start that fails (a rank
+# exits, WAIT_TIMEOUT, the smoke test) stops every rank: a supervisor's stop or retry never leaves a rank behind. With
+# the server already running on all four Sparks it attaches to it (no new smoke test) instead of saying "nothing to
+# do". start.lock stays held until it exits.
+# (From MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks's and GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold's start.sh,
+# for three workers.)
+FG_WATCH=""; FG_LOGS=""; SMOKE_PID=""
+# a rank's container as docker ps sees it, then "rc=<docker ps's status>": run here or on a worker (over ssh)
+PS_STATE="timeout 20 docker ps -a --filter 'name=^/?$CONTAINER_NAME\$' --format '{{.State}}' 2>/dev/null; echo rc=\$?"
+# rank_state <that output>: up, down (exited, or no such container) or unknown (no answer from docker or ssh)
+rank_state() {
+  case "$1" in
+    rc=0) echo down ;;
+    *$'\n'rc=0) case "${1%%$'\n'*}" in running|restarting|paused) echo up ;; *) echo down ;; esac ;;
+    *) echo unknown ;;
+  esac
+}
+here_state() { local s; s=$(eval "$PS_STATE"); rank_state "$s"; }
+stop_watch() {   # the watchdog ends at once, or within 5 s of an ssh it is waiting on; then it is killed
+  local n
+  [[ -n "$FG_WATCH" ]] || return 0
+  kill "$FG_WATCH" 2>/dev/null || true
+  for (( n = 0; n < 50; n++ )); do kill -0 "$FG_WATCH" 2>/dev/null || break; sleep 0.1; done
+  kill -9 "$FG_WATCH" 2>/dev/null || true
+  wait "$FG_WATCH" 2>/dev/null || true
+}
+fg_stop() {   # fg_stop <signal> <exit code>: the INT and TERM trap
+  trap '' INT TERM
+  [[ -z "$FG_WATCH" ]] || kill "$FG_WATCH" 2>/dev/null || true
+  [[ -z "$FG_LOGS" ]] || kill "$FG_LOGS" 2>/dev/null || true
+  [[ -z "$SMOKE_PID" ]] || kill "$SMOKE_PID" 2>/dev/null || true
+  warn "$1: stopping every rank (./stop.sh)"
+  ./stop.sh || warn "./stop.sh could not stop every rank: see above"
+  stop_watch
+  exit "$2"
+}
+fg_traps() { trap 'fg_stop SIGINT 130' INT; trap 'fg_stop SIGTERM 143' TERM; }
+foreground() {   # foreground <docker logs options>: where rank 0's log starts
+  local w code st n
+  trap - EXIT; LOGS_PID=""                           # step 4's log follower is long gone: nothing to kill on exit
+  ( exec 8>&-                                        # not holding start.sh's lock once start.sh has exited
+    trap 'kill $! 2>/dev/null; exit 0' TERM
+    declare -A down=() quiet=()
+    while :; do
+      sleep "$FOREGROUND_POLL" & wait $!
+      for i in 1 2 3; do
+        raw=$(worker "$i" "$PS_STATE") || raw+=$'\n'"ssh rc=$?"
+        case "$(rank_state "$raw")" in
+          up) down[$i]=0; quiet[$i]=0 ;;
+          down)
+            down[$i]=$(( ${down[$i]:-0} + 1 )); quiet[$i]=0
+            (( ${down[$i]} >= 2 )) || continue        # confirmed on the next poll, FOREGROUND_POLL seconds later
+            warn "rank $i on $(worker_host "$i") is not running (seen on two polls ${FOREGROUND_POLL}s apart; docker ps there said: $(tr '\n' ' ' <<<"$raw")): stopping rank 0"
+            docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME" >/dev/null 2>&1 || true
+            exit 1 ;;
+          *) down[$i]=0                               # a worker out of reach says nothing about its rank
+             (( ${quiet[$i]:-0} )) || warn "cannot check rank $i on $(worker_host "$i") ($(tr '\n' ' ' <<<"$raw")): no conclusion, checking again"
+             quiet[$i]=1 ;;
+        esac
+      done
+    done ) &
+  FG_WATCH=$!
+  # (both in the background, checked every second: a trapped signal ends a wait at once, not a command in the
+  # foreground, and a watchdog that ended is noticed while rank 0 still runs)
+  while :; do
+    docker logs -f "$@" "$CONTAINER_NAME" 8>&- 2>&1 &
+    FG_LOGS=$!
+    while kill -0 "$FG_LOGS" 2>/dev/null && kill -0 "$FG_WATCH" 2>/dev/null; do sleep 1 & wait $! || true; done
+    if ! kill -0 "$FG_WATCH" 2>/dev/null; then kill "$FG_LOGS" 2>/dev/null || true; wait "$FG_LOGS" 2>/dev/null || true; break; fi
+    wait "$FG_LOGS" || true
+    st=$(here_state); n=0
+    while [[ "$st" == unknown ]] && (( ++n < 3 )); do sleep 5; st=$(here_state); done
+    [[ "$st" == up ]] || break                       # down, or docker here did not answer three times
+    sleep 5; set -- --since "$(date +%s)"            # the log follower ended with rank 0 still up: follow it again
+  done
+  trap '' INT TERM                                   # the server has ended: finish taking it down
+  w=0
+  if kill -0 "$FG_WATCH" 2>/dev/null; then stop_watch; else wait "$FG_WATCH" || w=$?; fi
+  (( w == 0 || w == 1 )) || warn "the watchdog of ranks 1-3 ended (code $w): taking the server down"
+  # a ./stop.sh still at work (a supervisor's ExecStop) is waited for: its removal is what tells a stop from a crash
+  if command -v flock >/dev/null; then exec 7>"$STATE_DIR/stop.lock"; flock -w 300 7 || true; exec 7>&-; fi
+  if code=$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null); then
+    [[ "$code" =~ ^[0-9]+$ ]] || code=1
+    warn "rank 0 ended (exit code $code): stopping every rank left (./stop.sh)"
+  elif [[ "$(here_state)" == down ]]; then
+    code=0; log "rank 0's container was removed (./stop.sh): stopping every rank left (./stop.sh)"
+  else
+    code=1; warn "cannot read rank 0's exit code: stopping every rank left (./stop.sh)"
+  fi
+  (( w == 0 || code != 0 )) || code=1                # a worker's rank or the watchdog failed, even if rank 0 shut down cleanly
+  ./stop.sh || { warn "./stop.sh could not stop every rank: see above"; (( code )) || code=1; }
+  exit "$code"
+}
+
 if (( ! DRY )) && [[ "$MODE" == start ]] && all_running; then
+  if (( FG )); then
+    log "$CONTAINER_NAME is already running on all 4 Sparks (port $PORT): FOREGROUND=1 attaches to it. ./stop.sh (or SIGTERM to this script) stops it."
+    fg_traps
+    foreground --tail 50
+  fi
   log "$CONTAINER_NAME is already running on all 4 Sparks (port $PORT): nothing to do. $(launcher "$FABRIC_EXPECT") restart restarts it, ./stop.sh stops it."
   exit 0
 fi
@@ -138,6 +254,7 @@ KIT=/hf/$KIT_SUB/kit
 FOLLOW="--pool $POOL --context $CONTEXT --engram $MODEL_ARG --token-map $DATA/dsv41_token_map.json --drafts $DRAFTS --round-rows $ROUND_ROWS --streams $PARALLEL"
 FOLLOW+=" --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
 step 3 "Launch: container $CONTAINER_NAME, ranks 3 to 1 on the workers, then rank 0 here"
+(( DRY || ! FG )) || fg_traps                      # FOREGROUND=1: from here on, SIGINT and SIGTERM stop every rank
 IFS=, read -r -a ORD <<<"$NODE_ORDER"
 LOCAL_RANKS=()   # the workers that read their weight file from their own disk
 for i in 3 2 1; do
@@ -182,7 +299,11 @@ here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$HF_CACHE:/hf:ro")
 for x in "${ENV0[@]}" "${ENGINE_ENV[@]}"; do here+=(-e "$x"); done
 read -r -a nenv <<<"$(rank_nccl_env 0)"
 here+=("${nenv[@]}" "$IMAGE" "${SERVE[@]}")
-if (( DRY )); then printf '[dry-run] rank 0 here:\n  %s\n' "$(printf '%q ' "${here[@]}")"; exit 0; fi
+if (( DRY )); then
+  printf '[dry-run] rank 0 here:\n  %s\n' "$(printf '%q ' "${here[@]}")"
+  (( ! FG )) || log "DRY_RUN: FOREGROUND=1 would stay attached to rank 0 after the smoke test, checking ranks 1-3 every ${FOREGROUND_POLL}s"
+  exit 0
+fi
 log "Rank 0 here: ${SERVE[*]}"
 "${here[@]}" >/dev/null
 
@@ -200,22 +321,27 @@ trap 'kill $LOGS_PID 2>/dev/null || true' EXIT
 fail() {
   kill $LOGS_PID 2>/dev/null || true
   for i in 1 2 3; do printf '%s── rank %s (%s): last log lines ──%s\n' "$D" "$i" "$(worker_host "$i")" "$R"; worker "$i" docker logs --tail 15 "$CONTAINER_NAME" 2>&1 | sed 's/^/  │ /'; done
+  if (( FG )); then trap '' INT TERM; ./stop.sh || true; fi   # FOREGROUND=1: a failed start leaves no rank behind
   die "$1"
 }
+LEFT="the ranks are still running"; (( ! FG )) || LEFT="every rank was stopped (FOREGROUND=1)"
 start=$SECONDS
 until curl -sf --max-time 5 "$URL/v1/models" >/dev/null 2>&1; do
   running_here || fail "rank 0 exited (code $(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
   for i in 1 2 3; do running_worker "$i" || fail "rank $i on $(worker_host "$i") exited before the server was ready"; done
-  (( SECONDS - start < WAIT_TIMEOUT )) || fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); the ranks are still running"
+  (( SECONDS - start < WAIT_TIMEOUT )) || fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); $LEFT"
   sleep 5
 done
+FG_SINCE=$(date +%s)                               # FOREGROUND=1 follows rank 0's log again from here
 kill $LOGS_PID 2>/dev/null || true
 log "Server answered after $((SECONDS - start))s"
 
 # ---------------------------------------------------------------- 5. smoke test
 step 5 "Smoke test: one chat completion through all 4 ranks"
 # a pass needs HTTP 200, no error object and the assistant's reply text (curl -w adds the status as the last line)
-if smoke=$(curl -s --max-time 300 -w '\n%{http_code}' "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
+# (in the background and waited for: under FOREGROUND=1 a trapped SIGTERM need not wait out curl's 300 s)
+SMOKE_OUT="$STATE_DIR/smoke.out"
+{ curl -s --max-time 300 -w '\n%{http_code}' "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
              -d "{\"model\": \"$SERVED_NAME\", \"max_tokens\": 16, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}" |
            python3 -c 'import json,sys
 def no(why): sys.exit(why)
@@ -228,10 +354,14 @@ m.get("role", "assistant") == "assistant" or no("not the assistant")
 c = (m.get("content") or "").strip()
 c or no("no reply text")
 len(c) < 8 or len(set(c)) > 2 or no("one repeated character")
-print(repr(c[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
+print(repr(c[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null; } >"$SMOKE_OUT" 8>&- &
+SMOKE_PID=$!
+if wait "$SMOKE_PID"; then
+  SMOKE_PID=""; smoke=$(<"$SMOKE_OUT"); rm -f "$SMOKE_OUT"
   log "OK: $smoke"
 else
-  fail "the smoke test request failed (an HTTP error, an error reply, no reply text, or one character repeated); the ranks are still running"
+  SMOKE_PID=""; rm -f "$SMOKE_OUT"
+  fail "the smoke test request failed (an HTTP error, an error reply, no reply text, or one character repeated); $LEFT"
 fi
 # the address to print: HOST itself, or for a wildcard one of this Spark's own (0.0.0.0 binds IPv4 only: an IPv4 one)
 if [[ "$HOST" == 0.0.0.0 ]]; then IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk 'NF && !/:/ {print; exit}')
@@ -247,3 +377,4 @@ cat <<EOF
     Stop     ./stop.sh
 
 EOF
+[[ "$FG" != 1 ]] || foreground --since "$FG_SINCE"

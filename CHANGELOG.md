@@ -1,5 +1,16 @@
 # Changelog
 
+- **2026-11-07** -- `FOREGROUND=1` ([jochanan-ai](https://github.com/jochanan-ai)): `./start.sh` (and
+  `./start-switchless.sh`) for a supervisor (a systemd `Type=simple` service, llama-swap), as the two-Spark
+  DeepSeek-V4.1 and GLM-5.3-Flash recipes have it, for three workers. After the smoke test it stays attached to rank
+  0's log and exits with rank 0's code (1 when a worker's rank ended first or the watchdog failed; 0 when a `./stop.sh`
+  removed rank 0's container). A watchdog asks each worker what its container is every `FOREGROUND_POLL` seconds (30)
+  and stops rank 0 only when "exited" or "gone" is seen on two polls in a row; a worker it cannot ask concludes
+  nothing. Every rank left is then stopped with `./stop.sh`. SIGINT and SIGTERM stop every rank from the launch on
+  (the smoke test now runs in the background and is waited for), a failed start stops every rank too, and a server
+  already running on all four Sparks is attached to instead of left with "nothing to do". `./stop.sh` takes a lock
+  (`$STATE_DIR/stop.lock`, up to 300 s) and refuses a `STOP_TIMEOUT` that is not a count of seconds. Without
+  `FOREGROUND` start.sh does what it did. `tests/test_start_foreground.py` covers each path offline.
 - **2026-11-04** -- `0053` (Hector, [hecisaza](https://github.com/hecisaza)): a tool-call block (`<tool_call>`,
   `<|tool_call>` or `<x:tool_call>`) whose payload opens with a DSML opener but is shorter than that opener and its
   closer together made the parser cut both from it, a slice past the payload's start. A safety-checked build panics
